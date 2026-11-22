@@ -1,20 +1,24 @@
-"""Layer 4 - document reconstruction.
+"""Layer 4 - PDF page finalisation.
 
-Pure logic, no file or engine access: takes the outputs of the earlier layers
-(PyMuPDF text, OCR text, tables) and produces finished pages and a Document.
+Pure logic, no file or engine access: takes the outputs of the earlier layers (text blocks, OCR
+text, tables, image OCR) and produces finished pages: canonical blocks in reading order,
+``final_text``, page type and confidence.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Literal
 
-from ai.ingestion.cleaners import clean_text, mark_headings
-from ai.ingestion.models import Document, PageContent, PageType, TableData
+from ai.ingestion.cleaners import clean_inline, clean_text, has_content, is_heading
+from ai.ingestion.models import Block, BlockType, PageContent, PageType, SourceKind, TableData
+from ai.ingestion.structure import render_blocks
 
 logger = logging.getLogger(__name__)
 
 TableFormat = Literal["pipe", "key_value"]
+_OCR_BULLET = re.compile(r"^([•●▪■◦o\-–*»>]|\d{1,2}[.)])\s+(\S.*)$")
 
 
 class PageClassifier:
@@ -27,17 +31,14 @@ class PageClassifier:
         body_chars = len(page.text)
         has_tables = bool(page.tables)
         if page.ocr_applied:
-            # Text came from OCR => scanned; native text or tables on top => mixed
             if has_tables or body_chars >= self.min_text_chars:
                 return PageType.MIXED_PAGE
             return PageType.SCANNED_PAGE
         if page.images_with_text:
-            # Text recovered from embedded images: mixed unless there's nothing else
             if body_chars < self.min_text_chars and not has_tables:
                 return PageType.SCANNED_PAGE
             return PageType.MIXED_PAGE
         if has_tables:
-            # Little prose beyond the tables => table page; lots => mixed
             return PageType.TABLE_PAGE if body_chars < 4 * self.min_text_chars else PageType.MIXED_PAGE
         return PageType.TEXT_PAGE
 
@@ -57,7 +58,6 @@ class ConfidenceScorer:
         if not images:
             return native
 
-        # Blend native-text and image-OCR confidence, weighted by characters.
         image_chars = sum(len(i.ocr_text) for i in images)
         image_conf = sum((i.ocr_confidence or 0.0) * len(i.ocr_text) for i in images) / image_chars / 100.0
         native_chars = len(page.text) + sum(len(t.to_pipe_text()) for t in page.tables)
@@ -68,10 +68,9 @@ class ConfidenceScorer:
 
     @staticmethod
     def _native_score(page: PageContent) -> float:
-        """Confidence of the PyMuPDF text layer / tables alone."""
         text = page.text
         if not text and not page.tables:
-            return 0.0
+            return 1.0 if not page.images else 0.0  # an empty page is not an extraction failure
         if not text:
             return 0.9  # table-only page
         bad = text.count("�") + sum(1 for c in text if ord(c) < 32 and c not in "\n\t")
@@ -81,13 +80,46 @@ class ConfidenceScorer:
         return round(max(base - penalty, 0.0), 3)
 
 
+def ocr_text_to_blocks(text: str, page_number: int, confidence: float,
+                       source: SourceKind = SourceKind.OCR_PAGE) -> list[Block]:
+    """Turn OCR text (no font information) into heading / list / paragraph blocks."""
+    blocks: list[Block] = []
+    for para in re.split(r"\n\s*\n", clean_text(text)):
+        lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if len(lines) == 1 and is_heading(lines[0]):
+            blocks.append(Block(BlockType.HEADING, clean_inline(lines[0]), page_number, level=1,
+                                confidence=confidence, source=source))
+            continue
+        buffer: list[str] = []
+        for ln in lines:
+            m = _OCR_BULLET.match(ln)
+            if m:
+                if buffer:
+                    blocks.append(Block(BlockType.PARAGRAPH, " ".join(buffer), page_number,
+                                        confidence=confidence, source=source))
+                    buffer = []
+                marker = m.group(1) if m.group(1)[0].isdigit() else "•"
+                blocks.append(Block(BlockType.LIST_ITEM, clean_inline(m.group(2)), page_number,
+                                    list_marker=marker, confidence=confidence, source=source))
+            elif blocks and blocks[-1].type is BlockType.LIST_ITEM and not buffer and ln[:1].islower():
+                blocks[-1].text = f"{blocks[-1].text} {clean_inline(ln)}"
+            else:
+                buffer.append(clean_inline(ln))
+        if buffer:
+            blocks.append(Block(BlockType.PARAGRAPH, " ".join(buffer), page_number,
+                                confidence=confidence, source=source))
+    return [b for b in blocks if has_content(b.text)]
+
+
 class DocumentBuilder:
-    """Combines per-page layer outputs into a clean :class:`Document`.
+    """Finalises PDF pages.
 
     Args:
         classifier: Page classifier (injectable for testing).
         scorer: Confidence scorer (injectable for testing).
-        table_format: ``"pipe"`` (``Course | Grade``) or ``"key_value"`` (``Course: AI``).
+        table_format: Display rendering of tables: ``"pipe"`` or ``"key_value"``.
         min_text_chars: Used by the default classifier.
     """
 
@@ -102,64 +134,44 @@ class DocumentBuilder:
         self.scorer = scorer or ConfidenceScorer()
         self.table_format = table_format
 
-    # ------------------------------------------------------------------ page
     def finalize_page(self, page: PageContent) -> PageContent:
-        """Classify, score and assemble ``final_text`` for a page (in place)."""
+        """Classify, score, merge all blocks in reading order and render ``final_text`` (in place)."""
         page.page_type = self.classifier.classify(page)
         page.confidence = self.scorer.score(page)
-        page.final_text = self._assemble(page)
+        page.blocks = self._merge_blocks(page)
+        page.final_text = clean_text(render_blocks(page.blocks))
         return page
 
-    def _assemble(self, page: PageContent) -> str:
-        parts: list[str] = []
+    def _merge_blocks(self, page: PageContent) -> list[Block]:
+        text_blocks = list(page.blocks)
         if page.ocr_applied and page.ocr_text:
-            parts.append(mark_headings(page.ocr_text))
-        if page.text:
-            parts.append(page.text)
+            conf = round(min((page.ocr_confidence or 0.0) / 100.0, 1.0), 3)
+            text_blocks = ocr_text_to_blocks(page.ocr_text, page.page_number, conf) + text_blocks
 
-        # Tables and image text follow the body, ordered top-to-bottom on the page.
-        # Items without a position keep their relative order at the end.
-        extras: list[tuple[float, int, str]] = []
+        extras: list[Block] = []
         for table in page.tables:
-            extras.append((self._top(table.bbox), len(extras),
-                           f"[Table {table.index + 1}]\n{self._render_table(table)}"))
+            extras.append(Block(BlockType.TABLE, self._render_table(table), page.page_number,
+                                ref_index=table.index, bbox=table.bbox, table=table,
+                                confidence=0.9))
         for image in page.images_with_text:
-            extras.append((self._top(image.bbox), len(extras),
-                           f"[Image {image.index + 1} text]\n{image.ocr_text}"))
-        parts.extend(text for _, _, text in sorted(extras, key=lambda e: (e[0], e[1])))
-        return clean_text("\n\n".join(parts))
+            extras.append(Block(BlockType.IMAGE_OCR, image.ocr_text, page.page_number,
+                                ref_index=image.index, bbox=image.bbox, source=SourceKind.OCR_IMAGE,
+                                confidence=round(min((image.ocr_confidence or 0.0) / 100.0, 1.0), 3),
+                                metadata={"xref": image.xref, "width": image.width, "height": image.height}))
+        if not extras:
+            return text_blocks
 
-    @staticmethod
-    def _top(bbox: tuple[float, float, float, float] | None) -> float:
-        return bbox[1] if bbox else float("inf")
+        # Insert each extra before the first text block that starts below it.
+        merged = list(text_blocks)
+        positioned = sorted((e for e in extras if e.bbox), key=lambda b: b.bbox[1])  # type: ignore[index]
+        for extra in positioned:
+            top = extra.bbox[1]  # type: ignore[index]
+            index = next((i for i, b in enumerate(merged)
+                          if b.bbox is not None and b.type not in (BlockType.TABLE, BlockType.IMAGE_OCR)
+                          and b.bbox[1] > top), len(merged))
+            merged.insert(index, extra)
+        merged.extend(e for e in extras if not e.bbox)
+        return merged
 
     def _render_table(self, table: TableData) -> str:
         return table.to_key_value_text() if self.table_format == "key_value" else table.to_pipe_text()
-
-    # -------------------------------------------------------------- document
-    def build(self, source_path: str, pages: list[PageContent], metadata: dict[str, object]) -> Document:
-        """Create the final :class:`Document` with statistics."""
-        document = Document(source_path=source_path, pages=pages, metadata=metadata)
-        document.statistics = self.compute_statistics(document)
-        logger.info("Document built: %s", document.statistics)
-        return document
-
-    @staticmethod
-    def compute_statistics(document: Document) -> dict[str, object]:
-        pages = document.pages
-        count = lambda t: sum(p.page_type == t for p in pages)  # noqa: E731
-        confs = [p.confidence for p in pages]
-        return {
-            "total_pages": len(pages),
-            "text_pages": count(PageType.TEXT_PAGE),
-            "scanned_pages": count(PageType.SCANNED_PAGE),
-            "table_pages": count(PageType.TABLE_PAGE),
-            "mixed_pages": count(PageType.MIXED_PAGE),
-            "ocr_pages": sum(p.ocr_applied for p in pages),
-            "total_images": sum(p.image_count for p in pages),
-            "ocr_images": sum(len(p.images_with_text) for p in pages),
-            "image_ocr_pages": sum(bool(p.images_with_text) for p in pages),
-            "total_tables": sum(len(p.tables) for p in pages),
-            "average_confidence": round(sum(confs) / len(confs), 3) if confs else 0.0,
-            "low_confidence_pages": [p.page_number for p in pages if p.confidence < 0.6],
-        }

@@ -64,12 +64,9 @@ class TableExtractor:
             except Exception as exc:
                 logger.warning("Table extract failed on page %d: %s", page_number, exc)
                 continue
-            rows = [[cell_clean(c) for c in row] for row in raw]
-            rows = [r for r in rows if any(r)]  # drop empty rows
+            rows = normalize_grid([[cell_clean(c) for c in row] for row in raw])
             if len(rows) < self.min_rows or max((len(r) for r in rows), default=0) < self.min_cols:
                 continue
-            width = max(len(r) for r in rows)
-            rows = [r + [""] * (width - len(r)) for r in rows]
             tables.append(
                 TableData(page_number=page_number, index=len(tables), rows=rows,
                           bbox=tuple(found_table.bbox))  # type: ignore[arg-type]
@@ -77,3 +74,27 @@ class TableExtractor:
         if tables:
             logger.info("Page %d: %d table(s) extracted", page_number, len(tables))
         return tables
+
+
+def normalize_grid(rows: list[list[str]], min_cols: int = 2) -> list[list[str]]:
+    """Clean a raw cell grid.
+
+    Drops empty rows and columns, then merges adjacent *complementary* columns (never both filled in
+    the same row) - the spacer columns pdfplumber produces for merged / shaded cells.
+    """
+    rows = [r for r in rows if any(r)]
+    if not rows:
+        return []
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    keep = [i for i in range(width) if any(r[i] for r in rows)]
+    rows = [[r[i] for i in keep] for r in rows]
+    changed = True
+    while changed and rows and len(rows[0]) > min_cols:
+        changed = False
+        for i in range(len(rows[0]) - 1):
+            if all(not (r[i] and r[i + 1]) for r in rows):
+                rows = [r[:i] + [r[i] or r[i + 1]] + r[i + 2:] for r in rows]
+                changed = True
+                break
+    return rows
